@@ -1,0 +1,458 @@
+package TECH.core.services.impl;
+
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+
+import javax.jcr.Node;
+import javax.jcr.NodeIterator;
+import javax.jcr.PathNotFoundException;
+import javax.jcr.RepositoryException;
+import javax.jcr.Session;
+import javax.jcr.Workspace;
+
+import org.apache.felix.scr.annotations.Component;
+import org.apache.felix.scr.annotations.Properties;
+import org.apache.felix.scr.annotations.Property;
+import org.apache.felix.scr.annotations.Reference;
+import org.apache.felix.scr.annotations.Service;
+import org.apache.sling.api.resource.ResourceResolver;
+import org.apache.sling.api.resource.ResourceResolverFactory;
+import org.apache.sling.commons.json.JSONArray;
+import org.apache.sling.commons.json.JSONException;
+import org.apache.sling.commons.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.adobe.cq.mcm.salesforce.SalesforceResponse;
+import com.day.cq.commons.jcr.JcrUtil;
+import com.day.cq.replication.ReplicationActionType;
+import com.day.cq.replication.ReplicationException;
+import com.day.cq.replication.Replicator;
+import com.day.cq.wcm.webservicesupport.ConfigurationManagerFactory;
+
+import TECH.core.core.SCConstants;
+import TECH.core.core.ServicesPaths;
+import TECH.core.services.SCCommonService;
+import TECH.core.services.SCConnectorService;
+import TECH.core.services.SCGeneratePagesService;
+import TECH.core.services.SCGenericMappingService;
+
+
+/**************************************************************************************
+Java  Interface Name  :  SCGeneratePagesServiceImpl.java
+Version               :  1.0
+Created Date          :  Sep 8, 2017
+
+Function              :  This class is using for generating  the trail detail page in case, if there are no trail available in aem. 
+						 If Trial is there inside the AEM , it will update the meta data .  
+Modification Log      :
+
+ * *************************************************************************************/
+
+@Component(metatype = true, immediate = true)
+@Service
+@Properties({
+	@Property(name = "service.description", value = "TECH3.0 trials detail update service")})
+public class SCGeneratePagesServiceImpl implements SCGeneratePagesService{
+	private static final Logger log = LoggerFactory.getLogger(SCGeneratePagesServiceImpl.class);
+
+	private int flag=2;
+	//private ResourceResolver resourceResolver = null;
+	@Reference
+	private ConfigurationManagerFactory configurationManagerFactory;
+	@Reference
+	ResourceResolverFactory resourceResolverFactory;
+
+	@Reference
+	SCConnectorService salesforceService;
+	@Reference
+	SCGenericMappingService scGenericMappingService;
+	@Reference
+	private SCCommonService scCommonService;
+
+	@Reference
+	Replicator replicator;
+
+	/* 
+	 * Get all the update data about trial detail and generate page store the data
+	 * This method just call by timing task
+	 *@parameter startDate is the last update time
+	 *
+	 *@parameter endDate is the time you want update now
+	 *
+	 */
+	@Override
+	public Boolean generatePages(String startDate,String endDate) {
+		log.info("generatePages() method start. startDate={} and endDate={}",startDate,endDate);
+		String currentBatch = "1";
+		Boolean updateBoolean = Boolean.FALSE;
+		int noOfPagesUpdated=0;
+		int noOfNewNCTPage=0;
+		int noOfUpdatedNCTPage=0;
+		int noOfCompletedNCTPage=0;
+		
+		ResourceResolver resolver = scCommonService.getSCServiceResourceResolver();
+		final Session session = resolver.adaptTo(Session.class);
+		if(session!=null){
+			try {
+				//get all the updated data
+				JSONObject dataObject = new JSONObject();
+				Boolean dataFlag = Boolean.TRUE;
+				dataObject = getAllData(startDate,endDate,dataObject,currentBatch,dataFlag);
+
+				//dataObject = null;
+				if((dataObject == null || dataObject.length()==0) || !dataFlag){
+					log.info("In Sync Job did not get any Trial Data from SF.");
+					/*if (null!=session) {
+						session.logout();	
+					}*/	
+					return Boolean.TRUE;
+				}
+				//according the clinical trials to find the path and store the data
+				Iterator<String> keys = dataObject.keys();
+				
+				while(keys.hasNext()){
+					String languageName = keys.next();
+					List<String> pathList = scGenericMappingService.getLanguagePathByName(languageName.toLowerCase());
+					if(pathList == null){
+						continue;
+					}
+					JSONArray dataArray = dataObject.getJSONArray(languageName);
+					if(dataArray == null){
+						log.info("this language clinicals is null,language name: "+languageName);
+						continue;
+					}
+					log.info("Data Array Size = {} for Language = {} ",dataArray.length(),languageName);
+					for(String path:pathList){
+						Node currentNode = session.getNode(path);
+						for(int i=0;i<dataArray.length();i++){
+							if(checkTrial(dataArray.getJSONObject(i),path)){
+								NodeIterator nodeIter = currentNode.getNodes();
+								if(dataArray.getJSONObject(i).has("clinical_Trial") && dataArray.getJSONObject(i).getJSONObject("clinical_Trial").has("NCT_Id_Grouping_Code__c")){
+									String UID = dataArray.getJSONObject(i).getJSONObject("clinical_Trial").getString("NCT_Id_Grouping_Code__c");
+									if(UID == null){
+										log.info("can not get this trial UID:NCT Group Code ID");
+										continue;
+									}
+									String status = "";
+									if(dataArray.getJSONObject(i).getJSONObject("clinical_Trial").has("Recruitment_Status__c")){
+										status =  dataArray.getJSONObject(i).getJSONObject("clinical_Trial").getString("Recruitment_Status__c");
+									}
+									if(SCConstants.COMPLETED_TRIAL_STATUS.equals(status)){
+										log.info("This trial is completed.UID: "+UID);
+									}
+									Boolean hasPageFlag = false;
+									while(nodeIter.hasNext()){
+										Node thisNode = nodeIter.nextNode();
+										if(thisNode.getName().equals(UID)){
+											hasPageFlag = true;
+											if(SCConstants.COMPLETED_TRIAL_STATUS.equals(status)){
+												// update trial to completed page
+												updateCompletedTrial(session,thisNode,dataArray.getJSONObject(i),path,UID,status);
+												noOfCompletedNCTPage++;
+											}else{
+												// update normal trial detail page
+												updateNormallyTrial(thisNode,dataArray.getJSONObject(i));
+												session.save();
+												activatePath(session, thisNode.getNode(SCConstants.JCR_CONTENT).getPath());
+												noOfUpdatedNCTPage++;
+												break;
+											}
+										}
+									}
+									if(!hasPageFlag){
+										createPage(session,dataArray.getJSONObject(i),path,UID,status);
+										session.save();
+										noOfNewNCTPage++;
+									}
+								}
+								noOfPagesUpdated++;
+							}
+						}
+					}
+					//this method will be using in the feature for publish the detail page
+					//replicateDetailPage(session,pathList);
+				}
+			}catch(Exception e) {
+				log.info("sync and store clinical trials. Error={} ",e);
+			}finally {
+				log.info("No. of Completed NCT Pages={}",noOfCompletedNCTPage);
+				log.info("No. of Updated NCT Pages={}",noOfUpdatedNCTPage);
+				log.info("No. of New NCT Pages={}",noOfNewNCTPage);	
+				if(resolver!=null && resolver.isLive())
+				{
+					resolver.close();
+				}
+			} 
+		}else {
+			log.error("session is null while executing generatePages() method.");
+		}
+		//log.info("Total no. of pages Trial Pages created by sync job  "+noOfPagesUpdated);
+		updateBoolean = Boolean.TRUE;
+		log.info("generatePages() method end.");
+		return updateBoolean;
+	}
+	
+	//This method will get country code by update path
+	private String getCountryCodeByPath(String path){
+		String countryCode = "us";
+		path = path.replace(SCConstants.TECH_ROOT_PATH+SCConstants.SLASH, "");
+		String[] names = path.split(SCConstants.SLASH);
+		countryCode = names[0];
+		return countryCode;
+	}
+	//This method will get language code by update path
+	private String getLanguageCodeByPath(String path){
+		String languageCode = "en";
+		path = path.replace(SCConstants.TECH_ROOT_PATH+SCConstants.SLASH, "");
+		String[] names = path.split(SCConstants.SLASH);
+		languageCode = names[1];
+		return languageCode;
+	}
+
+	//Check this trial in that path is enabled or disabled
+	private Boolean checkTrial(JSONObject trial,String path){
+		Boolean flag = Boolean.TRUE;
+		try{
+//			path = path.replace(SCConstants.TECH_ROOT_PATH+SCConstants.SLASH, "");
+//			String[] names = path.split(SCConstants.SLASH);
+			String country = getCountryCodeByPath(path);
+			if(trial.has("restricted_Countries")){
+				JSONArray disabledList = trial.getJSONArray("restricted_Countries");
+				for(int i =0; i< disabledList.length();i++){
+					JSONObject obj = disabledList.getJSONObject(i);
+					if(obj.has("CountryCode")){
+						String countryCode = obj.getString("CountryCode");
+						if(country.equalsIgnoreCase(countryCode)){
+							flag = Boolean.FALSE;
+							log.info("Disabled: countryCode: "+countryCode+" pagePath: "+path);
+							log.info("Trial NCTID: "+trial.getJSONObject("clinical_Trial").getString("NCT_Id_Grouping_Code__c"));
+						}
+					}
+				}
+			}
+		}catch(Exception e){
+			log.info("check the trial is disabled or not in the current country has some error.");
+		}
+		return flag;
+	}
+
+	/* 
+	 * This method call by generate page,for creating the detail page
+	 */
+	private void createPage(Session session,Object object,String path,String name,String status) {
+		try {
+			Node pageNode = JcrUtil.createPath(path + SCConstants.SLASH + name, SCConstants.CQ_PAGE, session);
+			Node pageContentNode = pageNode.addNode(SCConstants.JCR_CONTENT);
+			pageContentNode.setPrimaryType(SCConstants.CQ_PAGECONTENT);
+			pageContentNode.setProperty(SCConstants.CQ_TEMPLATE, SCConstants.TEMPLATE_PATH);
+			pageContentNode.setProperty(SCConstants.JCR_TITLE,name);
+			pageContentNode.setProperty(SCConstants.SLING_RESOURCE_TYPE, SCConstants.TEMPLATE_RESOURCE_PATH);
+			// update the trail detail data
+			updatePage(pageContentNode,object);
+			// create the component
+			//createDefaultNode(pageContentNode,status,path);
+			session.save();
+			copyComponentFromTemplate(session,pageContentNode,status,path);
+			activatePath(session, path);
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+	}
+
+
+	/* 
+	 * This method call by generate page or create oage ,for setting trial detail data
+	 */
+	private void updatePage(Node pageNode, Object object) {
+		try {
+			pageNode.setProperty(SCConstants.TRIAL_DETAIL_PROPERTY_NAME,object.toString());
+		} catch (RepositoryException e) {
+			log.error("Error occured while update NCT josn. Error={}",e);
+		}
+	}
+	
+	//This method will copy the component from trial template under util
+	private void copyComponentFromTemplate(Session session,Node resourceNode,String status,String path){
+		String templatePath = "/content/TECH/{countryCode}/{languageCode}/util/{type}/jcr:content/left";
+		String countryCode = getCountryCodeByPath(path);
+		String languageCode = getLanguageCodeByPath(path);
+		templatePath = templatePath.replace("{countryCode}", countryCode).replace("{languageCode}", languageCode);
+		if(SCConstants.COMPLETED_TRIAL_STATUS.equals(status)){
+			templatePath = templatePath.replace("{type}", "completed-trials-template");
+		}else{
+			templatePath = templatePath.replace("{type}", "normal-trials-template");
+		}
+		String destinationPath = "";
+		try {
+			Node templateNode = session.getNode(templatePath);
+			if(templateNode!=null){
+				destinationPath = resourceNode.getPath()+SCConstants.SLASH+"left";
+				Workspace workspace = session.getWorkspace();
+				workspace.copy(templatePath, destinationPath);
+			}else{
+				log.info("Could not find the template path resource using path: "+templatePath);
+			}
+		}catch(Exception e){
+			log.info("Generate trial error using this trial path:: "+destinationPath);
+			log.info("Generate trial error using this template path: "+templatePath);
+		}
+	}
+
+	/* 
+	 * This method call by generate page ,for getting all update data from saleforce 
+	 */
+	private JSONObject getAllData(String startDate,String endDate,JSONObject dataObject,String currentBatch,Boolean dataFlag) {
+		//		JSONArray dataArray = null;
+		if(currentBatch.equals("0")){
+			log.info("Batch is 0");
+			return dataObject;
+		}
+		HashMap<String, String> parameters = new HashMap<String, String>();
+		String requestParam = "startDateTime="+startDate+"&endDateTime="+endDate+"&currentBatch="+currentBatch;
+		parameters.put("requestParam", requestParam);
+		SalesforceResponse salesforceResponse = salesforceService.executeRequest(ServicesPaths.ALL_DATAIL_TRAILS, null, parameters, SCConstants.HTTP_GET);
+		if(salesforceResponse == null){
+			log.info("getalldata(), response is null");
+			while(flag>0){
+				flag--;
+				getAllData(startDate,endDate,dataObject,currentBatch,dataFlag);
+				break;
+			}
+		}
+		if(salesforceResponse != null && salesforceResponse.getCode() == 200){
+			String data = salesforceResponse.getBody();
+			log.debug("data received"+data);
+			try {
+				JSONObject object = new JSONObject(data);
+				if(object.has("trial_Map")){
+					JSONObject thisDataObject = object.getJSONObject("trial_Map");
+					processClinicalTrials(dataObject,thisDataObject);
+				}
+				if(object.has("next_Batch")){
+					currentBatch = object.getString("next_Batch").toString();
+				}else{
+					return dataObject;
+				}
+				getAllData(startDate,endDate,dataObject,currentBatch,dataFlag);
+			} catch (JSONException e) {
+				log.error("Error while parsing thesf json data. full error ={}",e);
+				dataFlag = Boolean .FALSE;
+			}
+		}else{
+			dataFlag = Boolean .FALSE;
+		}
+		return dataObject;
+	}
+
+	/* 
+	 * This method call by generate page ,for getting the session to update data
+	 */
+	/*public Session getSession(){
+		Session session = null;
+		Map<String, Object> paramMap = new HashMap<String, Object>();
+		paramMap.put(ResourceResolverFactory.SUBSERVICE, "writeService");
+		try {
+			resourceResolver = resourceResolverFactory.getServiceResourceResolver(paramMap);
+			session = resourceResolver.adaptTo(Session.class);
+		} catch (LoginException e) {
+			log.error("Error while executing getSession() method. full error={}",e);
+		}
+		return session;
+	}*/
+
+	/* 
+	 * This method call while the trial detail data update, and publish the datail page 
+	 */
+//	private void replicateDetailPage(Session session,List<String> pathList){
+//		for(String path:pathList){
+//			try {
+//				replicator.replicate(session, ReplicationActionType.ACTIVATE, path);
+//				log.info("ReplicateDetailPagePath: "+path);
+//				Node parentNode = session.getNode(path);
+//				if(parentNode != null){
+//					NodeIterator detailPages = parentNode.getNodes();
+//					while(detailPages.hasNext()){
+//						Node detailPage = detailPages.nextNode();
+//						if(!detailPage.getName().equals(SCConstants.JCR_CONTENT)){
+//							replicator.replicate(session, ReplicationActionType.ACTIVATE, detailPage.getPath());
+//							log.info("ReplicateDetailPagePath: "+detailPage.getPath());
+//						}
+//					}
+//				}
+//				log.info("ReplicateDetailPagePath: "+path);
+//			} catch (ReplicationException e) {
+//				log.info("ReplicateDetailPage error: "+path);
+//				e.printStackTrace();
+//			} catch (PathNotFoundException e) {
+//				log.info("Parent path not fround: "+path);
+//				e.printStackTrace();
+//			} catch (RepositoryException e) {
+//				// TODO Auto-generated catch block
+//				e.printStackTrace();
+//			}
+//		}
+//	}
+
+	//This method can handle the clinical trial data from sales force.
+	private void processClinicalTrials(JSONObject allDataObject,JSONObject currentObject){
+		Iterator<String> keys = currentObject.keys();
+		while(keys.hasNext()){
+			String languageKey = keys.next();
+			try{
+				if(allDataObject.has(languageKey)){
+					JSONArray allArray = allDataObject.getJSONArray(languageKey);
+					JSONArray thisArray = currentObject.getJSONArray(languageKey);
+					for(int i = 0; i<thisArray.length();i++){
+						allArray.put(thisArray.get(i));
+					}
+				}else{
+					allDataObject.put(languageKey, currentObject.getJSONArray(languageKey));
+				}
+			}catch(Exception e){
+				log.info("combine clinical trials error. full error={}",e);
+			}
+		}
+	}
+
+	//This method deal with trial status is completed
+	private void updateCompletedTrial(Session session,Node thisNode,JSONObject obj,String path,String UID,String status){
+		try {
+			//deactivate trial detail page of publish instance
+			String pagePath = thisNode.getPath();
+			replicator.replicate(session,ReplicationActionType.DEACTIVATE,pagePath);
+			//remove the trial page from author
+			thisNode.remove();
+			session.save();
+			//create new page with completed layout
+			createPage(session,obj,path,UID,status);
+		} catch ( RepositoryException e) {
+			log.error("Error RepositoryException occured in updateCompletedTrial() method. Error={} ",e);
+		}catch (ReplicationException e1) {
+			log.error("Error ReplicationException occured in updateCompletedTrial() method. Error={} ",e1);
+		}
+	}
+
+	//This method deal with trial status is normal(recruiting or not yet recruiting)
+	private void updateNormallyTrial(Node thisNode,JSONObject obj){
+		try {
+			if(thisNode.hasNode(SCConstants.JCR_CONTENT)){
+				updatePage(thisNode.getNode(SCConstants.JCR_CONTENT), obj);
+			}
+		} catch (PathNotFoundException e) {
+			log.error("Error PathNotFoundException occured in updateNormallyTrial() method. Error={} ",e);
+		} catch (RepositoryException e1) {
+			log.error("Error RepositoryException occured in updateNormallyTrial() method. Error={} ",e1);
+		}
+	}
+	
+	private void activatePath(Session session, String path) {
+		try {
+			replicator.replicate(session, ReplicationActionType.ACTIVATE, path);
+			log.info("Replicated Path={} ",path);
+		} catch (ReplicationException e) {
+			log.error("Error occured while replicatiopn. path={} Error={}",path,e);
+		}
+	}
+}
