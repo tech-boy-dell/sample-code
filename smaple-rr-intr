@@ -1,0 +1,9 @@
+package com.integratedportal.core.service;
+
+import org.apache.sling.api.resource.ResourceResolver;
+
+public interface CommonService {
+
+    public ResourceResolver getResourceResolverObject();
+
+}
