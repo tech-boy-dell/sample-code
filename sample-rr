@@ -1,0 +1,42 @@
+package com.integratedportal.core.service.impl;
+
+
+import com.integratedportal.core.service.CommonService;
+import org.apache.sling.api.resource.ResourceResolver;
+import org.apache.sling.api.resource.ResourceResolverFactory;
+import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.ConfigurationPolicy;
+import org.osgi.service.component.annotations.Reference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Component(service = {CommonService.class}, configurationPolicy = ConfigurationPolicy.OPTIONAL)
+public class CommonServiceImpl implements CommonService {
+
+    private static final Logger LOG = LoggerFactory.getLogger(CommonServiceImpl.class);
+
+    @Reference
+    ResourceResolverFactory resourceResolverFactory;
+
+    @Override
+    public ResourceResolver getResourceResolverObject() {
+        ResourceResolver resourceResolver = null;
+        try
+        {
+            Map<String, Object> param = new HashMap<String, Object>();
+            param.put(ResourceResolverFactory.SUBSERVICE, "readservice");
+            resourceResolver = resourceResolverFactory.getServiceResourceResolver(param);
+        }
+        catch (Exception e)
+        {
+            LOG.error("error while getting resource resolver object:: "+e.getMessage());
+        }
+        return resourceResolver;
+    }
+
+}
+
+
